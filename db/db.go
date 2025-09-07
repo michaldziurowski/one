@@ -147,6 +147,7 @@ func scanRow[T any](rows *sql.Rows, columns []string) (T, error) {
 
 	scanValues := make([]any, len(columns))
 	columnToField := make(map[string]reflect.Value)
+	nullableFields := make(map[int]reflect.Value) // Track fields that need NULL handling
 
 	for i := 0; i < resultType.NumField(); i++ {
 		field := resultType.Field(i)
@@ -166,7 +167,34 @@ func scanRow[T any](rows *sql.Rows, columns []string) (T, error) {
 
 	for i, column := range columns {
 		if fieldValue, exists := columnToField[column]; exists {
-			scanValues[i] = fieldValue.Addr().Interface()
+			fieldType := fieldValue.Type()
+
+			// Handle non-pointer types that need NULL support
+			switch fieldType.Kind() {
+			case reflect.String:
+				// Use sql.NullString for string fields to handle NULL
+				var nullStr sql.NullString
+				scanValues[i] = &nullStr
+				nullableFields[i] = fieldValue
+			case reflect.Int, reflect.Int64:
+				// Use sql.NullInt64 for int fields to handle NULL
+				var nullInt sql.NullInt64
+				scanValues[i] = &nullInt
+				nullableFields[i] = fieldValue
+			case reflect.Float64:
+				// Use sql.NullFloat64 for float64 fields to handle NULL
+				var nullFloat sql.NullFloat64
+				scanValues[i] = &nullFloat
+				nullableFields[i] = fieldValue
+			case reflect.Bool:
+				// Use sql.NullBool for bool fields to handle NULL
+				var nullBool sql.NullBool
+				scanValues[i] = &nullBool
+				nullableFields[i] = fieldValue
+			default:
+				// For pointer types and other types, use direct scanning
+				scanValues[i] = fieldValue.Addr().Interface()
+			}
 		} else {
 			var dummy any
 			scanValues[i] = &dummy
@@ -175,6 +203,36 @@ func scanRow[T any](rows *sql.Rows, columns []string) (T, error) {
 
 	if err := rows.Scan(scanValues...); err != nil {
 		return result, err
+	}
+
+	// Convert NULL values to appropriate zero values for non-pointer fields
+	for i, fieldValue := range nullableFields {
+		switch v := scanValues[i].(type) {
+		case *sql.NullString:
+			if v.Valid {
+				fieldValue.SetString(v.String)
+			} else {
+				fieldValue.SetString("") // NULL → empty string
+			}
+		case *sql.NullInt64:
+			if v.Valid {
+				fieldValue.SetInt(v.Int64)
+			} else {
+				fieldValue.SetInt(0) // NULL → 0
+			}
+		case *sql.NullFloat64:
+			if v.Valid {
+				fieldValue.SetFloat(v.Float64)
+			} else {
+				fieldValue.SetFloat(0.0) // NULL → 0.0
+			}
+		case *sql.NullBool:
+			if v.Valid {
+				fieldValue.SetBool(v.Bool)
+			} else {
+				fieldValue.SetBool(false) // NULL → false
+			}
+		}
 	}
 
 	return result, nil

@@ -9,9 +9,11 @@ import (
 )
 
 type User struct {
-	ID       int `db:"id"`
-	UserName string
-	Email    string
+	ID          int `db:"id"`
+	UserName    string
+	Email       string
+	OptionalBio *string // nullable field using pointer - NULL becomes nil
+	NotWeird    string  // nullable field using string - NULL becomes ""
 }
 
 func main() {
@@ -28,7 +30,9 @@ func main() {
 		CREATE TABLE IF NOT EXISTS users (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_name TEXT NOT NULL,
-			email TEXT NOT NULL UNIQUE
+			email TEXT NOT NULL UNIQUE,
+			optional_bio TEXT,
+			not_weird TEXT
 		)
 	`)
 	if err != nil {
@@ -37,10 +41,10 @@ func main() {
 
 	fmt.Println("Inserting sample data...")
 	_, err = db.Exec(ctx, `
-		INSERT OR REPLACE INTO users (id, user_name, email) VALUES 
-		(1, 'John Doe', 'john@example.com'),
-		(2, 'Jane Smith', 'jane@example.com'),
-		(3, 'Bob Johnson', 'bob@example.com')
+		INSERT OR REPLACE INTO users (id, user_name, email, optional_bio, not_weird) VALUES 
+		(1, 'John Doe', 'john@example.com', 'Software developer', 'weirdnot'),
+		(2, 'Jane Smith', 'jane@example.com', NULL, ''),
+		(3, 'Bob Johnson', 'bob@example.com', '', NULL)
 	`)
 	if err != nil {
 		log.Fatalf("Failed to insert data: %v", err)
@@ -55,13 +59,18 @@ func main() {
 		fmt.Printf("ID: %d, UserName: %s, Email: %s\n", user.ID, user.UserName, user.Email)
 	}
 
-	fmt.Println("\nQuerying users with SELECT * (demonstrates snake_case mapping):")
-	for user, err := range db.Query[User](ctx, "SELECT * FROM users WHERE id > ?", 1) {
+	fmt.Println("\nQuerying users with SELECT * (demonstrates NULL handling):")
+	for user, err := range db.Query[User](ctx, "SELECT * FROM users ORDER BY id") {
 		if err != nil {
 			log.Printf("Error: %v", err)
 			break
 		}
-		fmt.Printf("ID: %d, UserName: %s, Email: %s\n", user.ID, user.UserName, user.Email)
+		bioStr := "<nil>"
+		if user.OptionalBio != nil {
+			bioStr = *user.OptionalBio
+		}
+		fmt.Printf("ID: %d, UserName: %s, Email: %s, OptionalBio: '%s', NotWeird: '%s'\n",
+			user.ID, user.UserName, user.Email, bioStr, user.NotWeird)
 	}
 
 	fmt.Println("\nQuerying scalar values - user names:")
@@ -82,4 +91,3 @@ func main() {
 		fmt.Printf("Total users: %d\n", count)
 	}
 }
-
