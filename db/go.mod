@@ -1,4 +1,4 @@
-module db
+module github.com/michaldziurowski/one/db
 
 go 1.24
 
