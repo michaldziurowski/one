@@ -1,13 +1,15 @@
-// Package db provides a SQLite database abstraction with generic query support.
+// Package db provides a SQLite database abstraction compatible with database/sql.
 //
 // This package offers a simple interface for SQLite operations using modernc.org/sqlite
-// driver. It supports both struct mapping with automatic snake_case conversion and
-// scalar value queries through Go generics.
+// driver. It exposes stdlib-compatible methods (QueryContext, QueryRowContext, ExecContext, BeginTx)
+// along with generic scanning functions (Scan, ScanAll) for mapping rows to Go types.
 //
 // Key features:
+//   - stdlib-compatible API: QueryContext, QueryRowContext, ExecContext, BeginTx
+//   - Generic Scan[T] for single row mapping
+//   - Generic ScanAll[T] for multiple rows with iterator pattern
 //   - Hybrid column mapping: explicit db tags or automatic snake_case conversion
-//   - Support for SELECT * queries with any column order
-//   - Generic Query[T] function supporting both structs and scalar types
+//   - Support for SELECT * queries with any column order (ScanAll only)
 //   - Iterator-based results with iter.Seq2[T, error] for proper error handling
 //   - Database initialization from APP_NAME environment variable
 //
@@ -19,21 +21,33 @@
 //	}
 //	defer close()
 //
-//	// Struct queries
-//	for user, err := range db.Query[User](ctx, "SELECT * FROM users") {
+//	// Single row query
+//	row := db.QueryRowContext(ctx, "SELECT * FROM users WHERE id = ?", 1)
+//	user, err := db.Scan[User](row)
+//	if err != nil {
+//		// handle error
+//	}
+//
+//	// Multiple rows query
+//	rows, err := db.QueryContext(ctx, "SELECT * FROM users ORDER BY id")
+//	if err != nil {
+//		// handle error
+//	}
+//	for user, err := range db.ScanAll[User](rows) {
 //		if err != nil {
 //			// handle error
 //		}
 //		// use user
 //	}
 //
-//	// Scalar queries
-//	for name, err := range db.Query[string](ctx, "SELECT user_name FROM users") {
-//		if err != nil {
-//			// handle error
-//		}
-//		// use name
+//	// Transaction
+//	tx, err := db.BeginTx(ctx, nil)
+//	if err != nil {
+//		// handle error
 //	}
+//	defer tx.Rollback()
+//	// ... use tx
+//	tx.Commit()
 package db
 
 import (
@@ -82,51 +96,27 @@ func Init() (func() error, error) {
 	return closeFunc, nil
 }
 
-func Query[T any](ctx context.Context, query string, args ...any) iter.Seq2[T, error] {
-	return func(yield func(T, error) bool) {
-		var zero T
-
-		if db == nil {
-			yield(zero, fmt.Errorf("database not initialized, call Init() first"))
-			return
-		}
-
-		rows, err := db.QueryContext(ctx, query, args...)
-		if err != nil {
-			yield(zero, fmt.Errorf("failed to execute query: %w", err))
-			return
-		}
-		defer rows.Close()
-
-		columns, err := rows.Columns()
-		if err != nil {
-			yield(zero, fmt.Errorf("failed to get columns: %w", err))
-			return
-		}
-
-		for rows.Next() {
-			select {
-			case <-ctx.Done():
-				yield(zero, ctx.Err())
-				return
-			default:
-			}
-
-			result, err := scanRow[T](rows, columns)
-			if err != nil {
-				yield(zero, fmt.Errorf("failed to scan row: %w", err))
-				return
-			}
-
-			if !yield(result, nil) {
-				return
-			}
-		}
-
-		if err := rows.Err(); err != nil {
-			yield(zero, fmt.Errorf("row iteration error: %w", err))
-		}
+// QueryContext executes a query that returns rows, typically a SELECT.
+// The args are for any placeholder parameters in the query.
+func QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized, call Init() first")
 	}
+	return db.QueryContext(ctx, query, args...)
+}
+
+// QueryRowContext executes a query that is expected to return at most one row.
+// The args are for any placeholder parameters in the query.
+func QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return db.QueryRowContext(ctx, query, args...)
+}
+
+// BeginTx starts a transaction. The default isolation level is dependent on the driver.
+func BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not initialized, call Init() first")
+	}
+	return db.BeginTx(ctx, opts)
 }
 
 func scanRow[T any](rows *sql.Rows, columns []string) (T, error) {
@@ -253,9 +243,150 @@ func toSnakeCase(s string) string {
 	return result.String()
 }
 
-func Exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+// ExecContext executes a query without returning any rows.
+// The args are for any placeholder parameters in the query.
+func ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if db == nil {
 		return nil, fmt.Errorf("database not initialized, call Init() first")
 	}
 	return db.ExecContext(ctx, query, args...)
+}
+
+// Scan scans a single row into a value of type T.
+// For scalar types (string, int, etc.), it scans directly.
+// For struct types, it scans fields in declaration order with NULL handling.
+// Pointer fields receive nil for NULL values, non-pointer primitives receive zero values.
+func Scan[T any](row *sql.Row) (T, error) {
+	var result T
+	resultType := reflect.TypeOf(result)
+
+	// Handle scalar types
+	if resultType.Kind() != reflect.Struct {
+		if err := row.Scan(&result); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+
+	// Handle struct types - scan fields in declaration order
+	resultValue := reflect.ValueOf(&result).Elem()
+	scanValues := make([]any, 0, resultType.NumField())
+	nullableFields := make([]struct {
+		index int
+		value reflect.Value
+	}, 0)
+
+	for i := 0; i < resultType.NumField(); i++ {
+		fieldValue := resultValue.Field(i)
+
+		if !fieldValue.CanSet() {
+			continue
+		}
+
+		fieldType := fieldValue.Type()
+
+		// Handle non-pointer types that need NULL support
+		switch fieldType.Kind() {
+		case reflect.String:
+			var nullStr sql.NullString
+			scanValues = append(scanValues, &nullStr)
+			nullableFields = append(nullableFields, struct {
+				index int
+				value reflect.Value
+			}{len(scanValues) - 1, fieldValue})
+		case reflect.Int, reflect.Int64:
+			var nullInt sql.NullInt64
+			scanValues = append(scanValues, &nullInt)
+			nullableFields = append(nullableFields, struct {
+				index int
+				value reflect.Value
+			}{len(scanValues) - 1, fieldValue})
+		case reflect.Float64:
+			var nullFloat sql.NullFloat64
+			scanValues = append(scanValues, &nullFloat)
+			nullableFields = append(nullableFields, struct {
+				index int
+				value reflect.Value
+			}{len(scanValues) - 1, fieldValue})
+		case reflect.Bool:
+			var nullBool sql.NullBool
+			scanValues = append(scanValues, &nullBool)
+			nullableFields = append(nullableFields, struct {
+				index int
+				value reflect.Value
+			}{len(scanValues) - 1, fieldValue})
+		default:
+			// For pointer types and other types, use direct scanning
+			scanValues = append(scanValues, fieldValue.Addr().Interface())
+		}
+	}
+
+	if err := row.Scan(scanValues...); err != nil {
+		return result, err
+	}
+
+	// Convert NULL values to appropriate zero values for non-pointer fields
+	for _, nf := range nullableFields {
+		switch v := scanValues[nf.index].(type) {
+		case *sql.NullString:
+			if v.Valid {
+				nf.value.SetString(v.String)
+			} else {
+				nf.value.SetString("") // NULL → empty string
+			}
+		case *sql.NullInt64:
+			if v.Valid {
+				nf.value.SetInt(v.Int64)
+			} else {
+				nf.value.SetInt(0) // NULL → 0
+			}
+		case *sql.NullFloat64:
+			if v.Valid {
+				nf.value.SetFloat(v.Float64)
+			} else {
+				nf.value.SetFloat(0.0) // NULL → 0.0
+			}
+		case *sql.NullBool:
+			if v.Valid {
+				nf.value.SetBool(v.Bool)
+			} else {
+				nf.value.SetBool(false) // NULL → false
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// ScanAll scans multiple rows into an iterator of type T.
+// For scalar types, each row must have exactly one column.
+// For struct types, it maps columns to fields using db tags or snake_case conversion.
+// Supports flexible column ordering and NULL handling like the original Query[T].
+func ScanAll[T any](rows *sql.Rows) iter.Seq2[T, error] {
+	return func(yield func(T, error) bool) {
+		var zero T
+		defer rows.Close()
+
+		columns, err := rows.Columns()
+		if err != nil {
+			yield(zero, fmt.Errorf("failed to get columns: %w", err))
+			return
+		}
+
+		for rows.Next() {
+			result, err := scanRow[T](rows, columns)
+			if err != nil {
+				yield(zero, fmt.Errorf("failed to scan row: %w", err))
+				return
+			}
+
+			if !yield(result, nil) {
+				return
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			yield(zero, fmt.Errorf("row iteration error: %w", err))
+		}
+	}
 }
