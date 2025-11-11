@@ -71,7 +71,13 @@ func Init() (func() error, error) {
 		return nil, fmt.Errorf("APP_NAME environment variable is required")
 	}
 
-	dbPath := appName + ".db"
+	// Ensure data directory exists
+	dataDir := "./data"
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	dbPath := dataDir + "/" + appName + ".db"
 	conn, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
