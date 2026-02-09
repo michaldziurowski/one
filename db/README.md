@@ -127,13 +127,39 @@ See the [full example](example/main.go) for comprehensive demonstrations includi
 
 ## Database Location
 
-The database file path is determined by the `APP_NAME` environment variable:
+The database file is stored in a `./data/` directory, determined by the `APP_NAME` environment variable:
 
 ```bash
 APP_NAME=myapp go run .
 ```
 
-Creates/opens: `myapp.db`
+Creates/opens: `./data/myapp.db`
+
+## SQLite Configuration
+
+The library applies server-oriented SQLite best practices based on [kerkour.com/sqlite-for-servers](https://kerkour.com/sqlite-for-servers).
+
+### Read/Write Pool Split
+
+Two separate connection pools are used:
+
+- **Write pool** (`SetMaxOpenConns(1)`): Serializes writes at the application level to prevent lock contention. Uses `_txlock=immediate` to acquire the write lock upfront in transactions.
+- **Read pool** (`SetMaxOpenConns(max(4, NumCPU))`): Scales concurrent readers with available CPU cores. WAL mode allows reads to proceed without blocking on writes.
+
+### PRAGMA Settings
+
+Applied to both pools on initialization:
+
+| PRAGMA | Value | Purpose |
+|---|---|---|
+| `journal_mode` | WAL | Enables concurrent reads during writes |
+| `synchronous` | NORMAL | Safe with WAL, better performance than FULL |
+| `cache_size` | -1000000 | ~1 GB page cache (negative = KiB) |
+| `foreign_keys` | true | Enforces foreign key constraints |
+| `busy_timeout` | 5000 | Retries on lock contention for up to 5 seconds |
+| `temp_store` | memory | Keeps temporary tables in RAM |
+
+On shutdown, `PRAGMA wal_checkpoint(TRUNCATE)` is called to fold the WAL back into the database file before closing.
 
 ## License
 

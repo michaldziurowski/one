@@ -53,17 +53,23 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"iter"
+	"net/url"
 	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"unicode"
 
 	_ "modernc.org/sqlite"
 )
 
-var db *sql.DB
+var (
+	readDB  *sql.DB
+	writeDB *sql.DB
+)
 
 func Init() (func() error, error) {
 	appName := os.Getenv("APP_NAME")
@@ -71,32 +77,70 @@ func Init() (func() error, error) {
 		return nil, fmt.Errorf("APP_NAME environment variable is required")
 	}
 
-	// Ensure data directory exists
 	dataDir := "./data"
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
 	dbPath := dataDir + "/" + appName + ".db"
-	conn, err := sql.Open("sqlite", dbPath)
+
+	pragmas := url.Values{}
+	pragmas.Add("_pragma", "journal_mode=WAL")
+	pragmas.Add("_pragma", "synchronous=NORMAL")
+	pragmas.Add("_pragma", "cache_size=-1000000")
+	pragmas.Add("_pragma", "foreign_keys=true")
+	pragmas.Add("_pragma", "busy_timeout=5000")
+	pragmas.Add("_pragma", "temp_store=memory")
+
+	readDSN := dbPath + "?" + pragmas.Encode()
+	writeDSN := dbPath + "?" + pragmas.Encode() + "&_txlock=immediate"
+
+	rdb, err := sql.Open("sqlite", readDSN)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open database: %w", err)
+		return nil, fmt.Errorf("failed to open read database: %w", err)
+	}
+	rdb.SetMaxOpenConns(max(4, runtime.NumCPU()))
+
+	if err := rdb.Ping(); err != nil {
+		rdb.Close()
+		return nil, fmt.Errorf("failed to ping read database: %w", err)
 	}
 
-	if err := conn.Ping(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("failed to ping database: %w", err)
+	wdb, err := sql.Open("sqlite", writeDSN)
+	if err != nil {
+		rdb.Close()
+		return nil, fmt.Errorf("failed to open write database: %w", err)
+	}
+	wdb.SetMaxOpenConns(1)
+
+	if err := wdb.Ping(); err != nil {
+		rdb.Close()
+		wdb.Close()
+		return nil, fmt.Errorf("failed to ping write database: %w", err)
 	}
 
-	db = conn
+	readDB = rdb
+	writeDB = wdb
 
 	closeFunc := func() error {
-		if db != nil {
-			err := db.Close()
-			db = nil
-			return err
+		var errs []error
+		if writeDB != nil {
+			_, err := writeDB.ExecContext(context.Background(), "PRAGMA wal_checkpoint(TRUNCATE)")
+			if err != nil {
+				errs = append(errs, fmt.Errorf("wal checkpoint: %w", err))
+			}
+			if err := writeDB.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close write db: %w", err))
+			}
+			writeDB = nil
 		}
-		return nil
+		if readDB != nil {
+			if err := readDB.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("close read db: %w", err))
+			}
+			readDB = nil
+		}
+		return errors.Join(errs...)
 	}
 
 	return closeFunc, nil
@@ -105,24 +149,24 @@ func Init() (func() error, error) {
 // QueryContext executes a query that returns rows, typically a SELECT.
 // The args are for any placeholder parameters in the query.
 func QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	if db == nil {
+	if readDB == nil {
 		return nil, fmt.Errorf("database not initialized, call Init() first")
 	}
-	return db.QueryContext(ctx, query, args...)
+	return readDB.QueryContext(ctx, query, args...)
 }
 
 // QueryRowContext executes a query that is expected to return at most one row.
 // The args are for any placeholder parameters in the query.
 func QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	return db.QueryRowContext(ctx, query, args...)
+	return readDB.QueryRowContext(ctx, query, args...)
 }
 
 // BeginTx starts a transaction. The default isolation level is dependent on the driver.
 func BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
-	if db == nil {
+	if writeDB == nil {
 		return nil, fmt.Errorf("database not initialized, call Init() first")
 	}
-	return db.BeginTx(ctx, opts)
+	return writeDB.BeginTx(ctx, opts)
 }
 
 func scanRow[T any](rows *sql.Rows, columns []string) (T, error) {
@@ -252,10 +296,10 @@ func toSnakeCase(s string) string {
 // ExecContext executes a query without returning any rows.
 // The args are for any placeholder parameters in the query.
 func ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	if db == nil {
+	if writeDB == nil {
 		return nil, fmt.Errorf("database not initialized, call Init() first")
 	}
-	return db.ExecContext(ctx, query, args...)
+	return writeDB.ExecContext(ctx, query, args...)
 }
 
 // Scan scans a single row into a value of type T.
