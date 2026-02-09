@@ -15,7 +15,7 @@ A lightweight SQLite database abstraction for Go with a stdlib-compatible API an
 ## Installation
 
 ```bash
-go get github.com/michaldziurowski/one/db@v0.1.0
+go get github.com/michaldziurowski/one/db@v0.2.0
 ```
 
 **Requirements:** Go 1.24+
